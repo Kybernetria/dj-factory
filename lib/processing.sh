@@ -6,54 +6,209 @@
 # ==============================================
 is_non_aiff_source() {
     local ext="${1##*.}"
-    ext="${ext,,}"  # lowercase
+    ext="${ext,,}"
     [[ "$ext" =~ ^(mp3|m4a|alac|wav|wave)$ ]]
 }
 
-# ── Measure integrated loudness (LUFS) via loudnorm in measure-only mode ──
-# Returns the linear gain in dB needed to reach TARGET_I.
-# Falls back to 0 dB (no change) if measurement fails.
+absolute_path() {
+    local target="$1"
+    readlink -f "$target" 2>/dev/null || printf '%s\n' "$target"
+}
+
+trim_whitespace() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "$value"
+}
+
+prompt_with_current() {
+    local label="$1"
+    local current="$2"
+    local result=""
+
+    echo -e "  ${YELLOW}Current $label:${NC} $current" >&2
+    echo "  Press Enter to keep it, or edit/type a new value." >&2
+
+    if [[ -t 0 && -t 1 ]]; then
+        # -e/-i gives readline editing with the current value prefilled.
+        read -e -i "$current" -p "  $label: " result
+    else
+        read -r -p "  $label [$current]: " result
+        [[ -z "$result" ]] && result="$current"
+    fi
+
+    trim_whitespace "$result"
+}
+
+normalize_tidal_link() {
+    local link
+    link="$(trim_whitespace "$1")"
+    [[ -z "$link" ]] && return 0
+
+    # tidal-dl-ng is most reliable with /browse/ URLs. Shared playlist links are
+    # commonly copied as https://tidal.com/playlist/<uuid>; normalize those.
+    if [[ "$link" =~ tidal\.com/playlist/([0-9a-fA-F-]{36}) ]]; then
+        printf 'https://tidal.com/browse/playlist/%s\n' "${BASH_REMATCH[1]}"
+    elif [[ "$link" =~ tidal\.com/(track|album|playlist|video)/([^/?#[:space:]]+) ]]; then
+        printf 'https://tidal.com/browse/%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    else
+        printf '%s\n' "$link"
+    fi
+}
+
+audio_duration_seconds() {
+    local input_file="$1"
+    "$FFPROBE_BIN" -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null | \
+        awk '{printf "%.2f", $1}'
+}
+
+audio_duration_int() {
+    local input_file="$1"
+    local duration
+    duration="$(audio_duration_seconds "$input_file")"
+    [[ -z "$duration" ]] && duration=0
+    awk -v d="$duration" 'BEGIN { printf "%d", d + 0.5 }'
+}
+
+safe_remove_stemgen_work() {
+    local base_name="$1"
+    local expected_dir="$CURRENT_OUTPUT/$base_name"
+    local expected_stem="$CURRENT_OUTPUT/$base_name.stem.m4a"
+
+    # Stemgen caches/converts inside OUTPUT/base_name. If an earlier Tidal run
+    # produced a 30-second preview, that stale work folder can make all future
+    # stems 30 seconds even after the FLAC is redownloaded correctly.
+    [[ -d "$expected_dir" ]] && rm -rf "$expected_dir"
+    [[ -f "$expected_stem" ]] && rm -f "$expected_stem"
+}
+
+run_interruptible_command() {
+    local pid
+    local status
+
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@" < /dev/null &
+    else
+        "$@" < /dev/null &
+    fi
+
+    pid=$!
+    ACTIVE_CHILD_PID="$pid"
+    wait "$pid"
+    status=$?
+    ACTIVE_CHILD_PID=""
+    return "$status"
+}
+
+quarantine_short_tidal_previews() {
+    local scan_dir="$1"
+    local quarantine_dir="$scan_dir/_short_tidal_previews"
+    local file
+    local duration
+    local moved=0
+
+    [[ -d "$scan_dir" ]] || return 0
+
+    while IFS= read -r -d '' file; do
+        duration="$(audio_duration_int "$file")"
+        if (( duration >= 25 && duration <= 35 )); then
+            mkdir -p "$quarantine_dir"
+            mv -f "$file" "$quarantine_dir/"
+            echo -e "    ${YELLOW}⚠️ Quarantined likely 30-second Tidal preview: $(basename "$file")${NC}" >&2
+            moved=$((moved + 1))
+        fi
+    done < <(
+        find "$scan_dir" -maxdepth 1 -type f \
+            \( -iname "*.flac" -o -iname "*.wav" -o -iname "*.aiff" -o -iname "*.m4a" -o -iname "*.mp3" \) -print0 2>/dev/null
+    )
+
+    if (( moved > 0 )); then
+        echo -e "    ${YELLOW}⚠️ Moved ${moved} short preview file(s) to: $quarantine_dir${NC}" >&2
+        echo -e "    ${YELLOW}   Re-run Tidal after confirming login/subscription; skip_existing is disabled so full files can replace previews.${NC}" >&2
+    fi
+}
+
+safe_copy_to_dir() {
+    local source_path="$1"
+    local destination_dir="$2"
+    local target_path="$destination_dir/$(basename "$source_path")"
+    local source_real
+    local target_real
+
+    mkdir -p "$destination_dir"
+
+    source_real="$(absolute_path "$source_path")"
+    target_real="$(absolute_path "$target_path")"
+
+    if [[ "$source_real" == "$target_real" ]]; then
+        echo "$target_path"
+        return 0
+    fi
+
+    cp -f "$source_path" "$target_path" || return 1
+    echo "$target_path"
+}
+
+create_file_work_dir() {
+    local seed="$1"
+    local safe_seed
+
+    safe_seed="$(printf '%s' "$seed" | tr -cs '[:alnum:]._-' '_')"
+    mktemp -d "$RUN_TMP_DIR/${safe_seed}.XXXXXX"
+}
+
 measure_gain_db() {
     local input_file="$1"
     local json
-    json=$("$FFMPEG_BIN" -i "$input_file" -vn -filter:a 'loudnorm=print_format=json' \
-           -f null null -hide_banner 2>&1 | awk '/^\{/,/^\}/ {print}')
-
     local input_i
-    input_i=$(echo "$json" | grep '"input_i"' | awk -F': "' '{print $2}' | awk -F'"' '{print $1}')
+    local math_python="${PYTHON_PROC:-${BOOTSTRAP_PYTHON:-python3}}"
+
+    json=$(
+        "$FFMPEG_BIN" -i "$input_file" -vn -filter:a 'loudnorm=print_format=json' \
+            -f null null -hide_banner 2>&1 | awk '/^\{/,/^\}/ {print}'
+    )
+
+    input_i=$(printf '%s\n' "$json" | grep '"input_i"' | head -n 1 | awk -F': "' '{print $2}' | awk -F'"' '{print $1}')
 
     if [[ -z "$input_i" || "$input_i" == "-inf" ]]; then
         echo "0"
         return 1
     fi
 
-    python3 -c "print(round(float('$TARGET_I') - float('$input_i'), 2))" 2>/dev/null || echo "0"
+    "$math_python" -c "print(round(float('$TARGET_I') - float('$input_i'), 2))" 2>/dev/null || echo "0"
 }
 
-# ── Detect bit depth and sample rate via ffprobe ──
 get_audio_info() {
     local input_file="$1"
-    local ext="${input_file##*.}"
-    ext="${ext,,}"
-
-    # Bit depth: try bits_per_raw_sample first (works for FLAC), then bits_per_sample
     local bd
-    bd=$("$FFPROBE_BIN" -v error -select_streams a:0 \
-         -show_entries stream=bits_per_raw_sample \
-         -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)
-    [[ -z "$bd" || "$bd" == "0" || "$bd" == "N/A" ]] && \
-        bd=$("$FFPROBE_BIN" -v error -select_streams a:0 \
-             -show_entries stream=bits_per_sample \
-             -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)
+    local sr
+
+    bd=$(
+        "$FFPROBE_BIN" -v error -select_streams a:0 \
+            -show_entries stream=bits_per_raw_sample \
+            -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null
+    )
+
+    if [[ -z "$bd" || "$bd" == "0" || "$bd" == "N/A" ]]; then
+        bd=$(
+            "$FFPROBE_BIN" -v error -select_streams a:0 \
+                -show_entries stream=bits_per_sample \
+                -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null
+        )
+    fi
+
     [[ -z "$bd" || "$bd" == "0" || "$bd" == "N/A" ]] && bd=16
 
-    local sr
-    sr=$("$FFPROBE_BIN" -v error -select_streams a:0 \
-         -show_entries stream=sample_rate \
-         -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null)
+    sr=$(
+        "$FFPROBE_BIN" -v error -select_streams a:0 \
+            -show_entries stream=sample_rate \
+            -of default=noprint_wrappers=1:nokey=1 "$input_file" 2>/dev/null
+    )
+
     [[ -z "$sr" || "$sr" == "N/A" ]] && sr=44100
 
-    # Export for caller
     DETECTED_BD="$bd"
     DETECTED_SR="$sr"
 }
@@ -61,11 +216,16 @@ get_audio_info() {
 process_stem_normalization() {
     local input_file="$1"
     local output_dir="$2"
-    local filename=$(basename "$input_file")
-    local target_path="$output_dir/$filename"
-
+    local filename
+    local target_path
     local gain_diff
-    gain_diff=$(measure_gain_db "$input_file")
+    local ffmpeg_cmd=()
+
+    filename="$(basename "$input_file")"
+    target_path="$output_dir/$filename"
+    mkdir -p "$output_dir"
+
+    gain_diff="$(measure_gain_db "$input_file")"
 
     if [[ "$gain_diff" == "0" ]]; then
         echo -e "    🔊 Stem: loudness OK (no adjustment needed)" >&2
@@ -73,50 +233,58 @@ process_stem_normalization() {
         echo -e "    🔊 Normalizing Stem: ${gain_diff} dB" >&2
     fi
 
-    "$FFMPEG_BIN" -nostdin -i "$input_file" -af "volume=${gain_diff}dB" \
-        -c:a alac -c:v copy -map 0 \
-        -disposition:v:0 attached_pic -map_metadata 0 \
+    ffmpeg_cmd=(
+        "$FFMPEG_BIN" -nostdin -i "$input_file" -af "volume=${gain_diff}dB"
+        -c:a alac -c:v copy -map 0
+        -disposition:v:0 attached_pic -map_metadata 0
         -y -hide_banner -loglevel error "$target_path"
+    )
 
+    "${ffmpeg_cmd[@]}" || return 1
+    [[ -f "$target_path" ]] || return 1
     echo "$target_path"
 }
 
 process_audio_specs() {
     local input_file="$1"
     local output_dir="$2"
-    local normalize="${3:-1}"  # 1=normalize, 0=convert only
-    local filename=$(basename "$input_file")
-    local base_name="${filename%.*}"
-    local ext="${filename##*.}"
-    ext="${ext,,}"
-    local target_path="$output_dir/$base_name.aiff"
-
-    # --- Loudness measurement (only if normalizing) ---
+    local normalize="${3:-1}"
+    local filename
+    local base_name
+    local ext
+    local target_path
     local gain_diff="0"
+    local out_codec="pcm_s16be"
+    local output_sr=""
+    local ffmpeg_cmd=()
+
+    filename="$(basename "$input_file")"
+    base_name="${filename%.*}"
+    ext="${filename##*.}"
+    ext="${ext,,}"
+    target_path="$output_dir/$base_name.aiff"
+
+    mkdir -p "$output_dir"
+
     if [[ "$normalize" -eq 1 ]]; then
-        gain_diff=$(measure_gain_db "$input_file")
+        gain_diff="$(measure_gain_db "$input_file")"
     fi
 
-    # --- Detect format ---
     get_audio_info "$input_file"
 
-    # --- Output codec ---
-    local out_codec="pcm_s16be"
     if [[ "$ext" != "mp3" ]]; then
         case "$DETECTED_BD" in
             24|32) out_codec="pcm_s24be" ;;
-            *)     out_codec="pcm_s16be" ;;
+            *) out_codec="pcm_s16be" ;;
         esac
     fi
 
-    # --- Output sample rate (clamp to 44.1–48kHz range) ---
-    local sr_args=""
     if [[ "$ext" == "mp3" ]]; then
-        sr_args="-ar 44100"
+        output_sr="44100"
     elif (( DETECTED_SR < 44100 )); then
-        sr_args="-ar 44100"
+        output_sr="44100"
     elif (( DETECTED_SR > 48000 )); then
-        sr_args="-ar 48000"
+        output_sr="48000"
     fi
 
     if [[ "$gain_diff" != "0" ]]; then
@@ -125,17 +293,18 @@ process_audio_specs() {
         echo -e "    🔄 → AIFF ${out_codec##*_} ${DETECTED_SR}Hz" >&2
     fi
 
-    # --- Build filter chain ---
-    local af_args=""
-    [[ "$gain_diff" != "0" ]] && af_args="-af volume=${gain_diff}dB"
-
-    # --- Convert ---
-    "$FFMPEG_BIN" -nostdin -i "$input_file" \
-        $af_args $sr_args -c:a "$out_codec" \
-        -map 0:a:0 -map 0:v? -c:v copy \
-        -disposition:v:0 attached_pic \
-        -map_metadata 0 -write_id3v2 1 \
+    ffmpeg_cmd=("$FFMPEG_BIN" -nostdin -i "$input_file")
+    [[ "$gain_diff" != "0" ]] && ffmpeg_cmd+=( -af "volume=${gain_diff}dB" )
+    [[ -n "$output_sr" ]] && ffmpeg_cmd+=( -ar "$output_sr" )
+    ffmpeg_cmd+=(
+        -c:a "$out_codec"
+        -map 0:a:0 -map 0:v? -c:v copy
+        -disposition:v:0 attached_pic
+        -map_metadata 0 -write_id3v2 1
         -y -hide_banner -loglevel error "$target_path"
+    )
+
+    "${ffmpeg_cmd[@]}" || return 1
 
     if [[ ! -f "$target_path" ]]; then
         echo -e "    ❌ Conversion failed for: $filename" >&2
@@ -151,15 +320,10 @@ process_audio_specs() {
 show_menu() {
     CURRENT_INPUT="$DEFAULT_INPUT_DIR"
     CURRENT_OUTPUT="$DEFAULT_OUTPUT_DIR"
+    CURRENT_TIDAL=""
+    [[ -f "$TIDAL_URL_FILE" ]] && CURRENT_TIDAL="$(<"$TIDAL_URL_FILE")"
     SELECTIONS=(1 1 1 1 1)
     LABELS=("🌊 Tidal Download" "🏷️  OneTagger" "🔊 Normalize → AIFF" "🔨 Stem Separation" "🎹 Detune Detection")
-    DESCRIPTIONS=(
-        "Download from Tidal playlist/album"
-        "Auto-tag genre from online databases"
-        "Normalize to ${TARGET_I} LUFS, convert to AIFF"
-        "Create NI stem files (${STEM_MODEL})"
-        "Detect and tag pitch deviations"
-    )
 
     while true; do
         clear
@@ -170,6 +334,11 @@ show_menu() {
         echo ""
         echo -e "  ${YELLOW}INPUT ${NC} $CURRENT_INPUT"
         echo -e "  ${YELLOW}OUTPUT${NC} $CURRENT_OUTPUT"
+        if [[ -n "$CURRENT_TIDAL" ]]; then
+            echo -e "  ${YELLOW}TIDAL ${NC} $CURRENT_TIDAL"
+        else
+            echo -e "  ${YELLOW}TIDAL ${NC} (none saved)"
+        fi
         echo ""
         echo -e "  ─────── Pipeline Steps ───────"
 
@@ -181,7 +350,6 @@ show_menu() {
             fi
         done
 
-        # Count input files
         local file_count=0
         if [[ -d "$CURRENT_INPUT" ]]; then
             file_count=$(find "$CURRENT_INPUT" -maxdepth 1 -type f \
@@ -191,192 +359,253 @@ show_menu() {
         echo ""
         echo -e "  ─────── Actions ─────────────"
         echo -e "  ${GREEN}[R]${NC} Run Pipeline  (${file_count} files)"
-        echo -e "  [I] Edit Input   [O] Edit Output"
+        echo -e "  [I] Edit Input   [O] Edit Output   [T] Edit Tidal URL"
         echo -e "  [Q] Quit"
         echo ""
 
-        read -p "  > " choice
-        case $choice in
-            [0-4]) SELECTIONS[$choice]=$((1-SELECTIONS[$choice])) ;;
-            i|I) read -e -i "$CURRENT_INPUT" -p "  Input: " new_in
-                 [[ -n "$new_in" ]] && CURRENT_INPUT="$new_in" ;;
-            o|O) read -e -i "$CURRENT_OUTPUT" -p "  Output: " new_out
-                 [[ -n "$new_out" ]] && CURRENT_OUTPUT="$new_out" ;;
-            r|R) return 0 ;;
-            q|Q) echo ""; exit 0 ;;
+        read -r -p "  > " choice
+        case "$choice" in
+            [0-4]) SELECTIONS[$choice]=$((1 - SELECTIONS[$choice])) ;;
+            i|I)
+                new_in="$(prompt_with_current "Input" "$CURRENT_INPUT")"
+                [[ -n "$new_in" ]] && CURRENT_INPUT="$new_in"
+                ;;
+            o|O)
+                new_out="$(prompt_with_current "Output" "$CURRENT_OUTPUT")"
+                [[ -n "$new_out" ]] && CURRENT_OUTPUT="$new_out"
+                ;;
+            t|T)
+                new_tidal="$(prompt_with_current "Tidal URL" "$CURRENT_TIDAL")"
+                CURRENT_TIDAL="$(normalize_tidal_link "$new_tidal")"
+                if [[ -n "$CURRENT_TIDAL" ]]; then
+                    printf '%s\n' "$CURRENT_TIDAL" > "$TIDAL_URL_FILE"
+                else
+                    rm -f "$TIDAL_URL_FILE"
+                fi
+                ;;
+            r|R)
+                return 0
+                ;;
+            q|Q)
+                echo ""
+                exit 0
+                ;;
         esac
     done
+}
+
+process_single_file() {
+    local raw_file="$1"
+    local filename
+    local base_name
+    local current_source
+    local is_stem=0
+    local stems_enabled=0
+    local stem_created=0
+    local processed_file=""
+    local output_file=""
+    local final_file=""
+    local stem_file=""
+    local detune_tag=""
+    local check_file=""
+    local detune_out=""
+    local norm_flag
+    local work_dir=""
+    local stem_count_before=0
+    local stem_count_after=0
+    local created_stem=""
+    local source_duration=0
+    local processed_duration=0
+    local stem_duration=0
+
+    filename="$(basename "$raw_file")"
+    base_name="${filename%.*}"
+    current_source="$(absolute_path "$raw_file")"
+    source_duration="$(audio_duration_int "$current_source")"
+    [[ "$filename" == *.stem.m4a ]] && is_stem=1
+    [[ ${SELECTIONS[3]} -eq 1 && "$is_stem" -eq 0 ]] && stems_enabled=1
+
+    echo "---------------------------------------------------"
+    echo -e "🎵 ${CYAN}$filename${NC}"
+
+    if [[ ${SELECTIONS[1]} -eq 1 ]]; then
+        echo "    🏷️  Running OneTagger..."
+        if ! timeout 2m "$BIN_DIR/onetagger-cli" autotagger --config "$ONETAGGER_CONF" --path "$current_source"; then
+            echo -e "    ${YELLOW}⚠️ OneTagger failed or timed out; continuing.${NC}" >&2
+        fi
+    fi
+
+    if [[ "$stems_enabled" -eq 1 ]]; then
+        work_dir="$(create_file_work_dir "$base_name")" || return 1
+    fi
+
+    if [[ "$is_stem" -eq 1 ]]; then
+        if [[ ${SELECTIONS[2]} -eq 1 ]]; then
+            echo "    🔊 Normalizing Stem..."
+            processed_file="$(process_stem_normalization "$current_source" "$CURRENT_OUTPUT")" || return 1
+        else
+            processed_file="$(safe_copy_to_dir "$current_source" "$CURRENT_OUTPUT")" || return 1
+        fi
+    elif [[ ${SELECTIONS[2]} -eq 1 ]] || is_non_aiff_source "$current_source"; then
+        norm_flag="${SELECTIONS[2]}"
+        if [[ "$stems_enabled" -eq 1 ]]; then
+            processed_file="$(process_audio_specs "$current_source" "$work_dir" "$norm_flag")" || return 1
+        else
+            processed_file="$(process_audio_specs "$current_source" "$CURRENT_OUTPUT" "$norm_flag")" || return 1
+        fi
+    else
+        if [[ "$stems_enabled" -eq 1 ]]; then
+            processed_file="$(safe_copy_to_dir "$current_source" "$work_dir")" || return 1
+        else
+            processed_file="$(safe_copy_to_dir "$current_source" "$CURRENT_OUTPUT")" || return 1
+        fi
+    fi
+
+    if [[ "$stems_enabled" -eq 1 ]]; then
+        processed_duration="$(audio_duration_int "$processed_file")"
+        if (( source_duration >= 60 && processed_duration > 0 && processed_duration < source_duration - 10 )); then
+            echo -e "    ${YELLOW}⚠️ Skipping Stemgen: converted file is shorter than source (${processed_duration}s vs ${source_duration}s).${NC}" >&2
+            echo -e "    ${YELLOW}   Delete/redownload this Tidal track if it is a 30-second preview.${NC}" >&2
+            final_file="$(safe_copy_to_dir "$processed_file" "$CURRENT_OUTPUT")" || return 1
+        else
+            echo "    🔨 Handing off to Stemgen..."
+
+            safe_remove_stemgen_work "$base_name"
+            stem_count_before=$(find "$CURRENT_OUTPUT" -maxdepth 1 -name "*.stem.m4a" -type f 2>/dev/null | wc -l)
+
+            if ! run_interruptible_command "$STEMGEN_BIN" -i "$processed_file" -n "$STEM_MODEL" --device "$STEM_DEVICE" -o "$CURRENT_OUTPUT/"; then
+                echo -e "    ${YELLOW}⚠️ Stemgen failed for $filename${NC}" >&2
+            else
+                stem_count_after=$(find "$CURRENT_OUTPUT" -maxdepth 1 -name "*.stem.m4a" -type f 2>/dev/null | wc -l)
+                if [[ "$stem_count_after" -gt "$stem_count_before" ]]; then
+                    created_stem="$(find "$CURRENT_OUTPUT" -maxdepth 1 -name "*.stem.m4a" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
+                fi
+
+                if [[ -n "$created_stem" && -f "$created_stem" ]]; then
+                    local expected_stem
+                    expected_stem="$CURRENT_OUTPUT/${base_name}.stem.m4a"
+                    if [[ "$created_stem" != "$expected_stem" ]]; then
+                        mv "$created_stem" "$expected_stem" 2>/dev/null || true
+                        if [[ -f "$expected_stem" ]]; then
+                            stem_file="$expected_stem"
+                        else
+                            stem_file="$created_stem"
+                        fi
+                    else
+                        stem_file="$created_stem"
+                    fi
+
+                    stem_duration="$(audio_duration_int "$stem_file")"
+                    if (( processed_duration >= 60 && stem_duration > 0 && stem_duration < processed_duration - 10 )); then
+                        echo -e "    ${YELLOW}⚠️ Stemgen produced a short stem (${stem_duration}s vs ${processed_duration}s); deleting it.${NC}" >&2
+                        rm -f "$stem_file"
+                    else
+                        stem_created=1
+                        echo "    ✅ Stem Created: $(basename "$stem_file")"
+                    fi
+                else
+                    echo -e "    ${YELLOW}⚠️ Stem file not found after stemgen run.${NC}" >&2
+                fi
+            fi
+
+            final_file="$(safe_copy_to_dir "$processed_file" "$CURRENT_OUTPUT")" || return 1
+        fi
+    fi
+
+    if [[ -n "$final_file" && -f "$final_file" ]]; then
+        output_file="$final_file"
+    else
+        output_file="$processed_file"
+    fi
+
+    if [[ ${SELECTIONS[4]} -eq 1 ]]; then
+        echo "    🎹 Checking Detune..."
+        check_file="$output_file"
+        if [[ "$stem_created" -eq 1 && -f "$stem_file" ]]; then
+            check_file="$stem_file"
+        fi
+        detune_out=$("$PYTHON_PROC" "$SCRIPT_DIR/analyze_stems.py" "$check_file" 2>&1 | tail -n 1)
+        if [[ "$detune_out" =~ ^[+-][0-9]+c$ ]]; then
+            detune_tag="$detune_out"
+        fi
+    fi
+
+    if [[ -n "$detune_tag" ]]; then
+        "$PYTHON_PROC" "$SCRIPT_DIR/write_tag.py" "$output_file" "$detune_tag"
+        if [[ "$stem_created" -eq 1 && -f "$stem_file" ]]; then
+            "$PYTHON_PROC" "$SCRIPT_DIR/write_tag.py" "$stem_file" "$detune_tag"
+        fi
+        echo "    🎹 Tagged: $detune_tag"
+    fi
+
+    return 0
 }
 
 # ==============================================
 # PIPELINE
 # ==============================================
 run_pipeline() {
-    mkdir -p "$CURRENT_OUTPUT"
+    mkdir -p "$CURRENT_OUTPUT" "$TMP_DIR"
+    RUN_TMP_DIR="$(mktemp -d "$TMP_DIR/run.XXXXXX")" || {
+        echo -e "${RED}❌ Failed to create repo-local temp directory in $TMP_DIR${NC}" >&2
+        return 1
+    }
 
-    # --- STEP 0: TIDAL DOWNLOADER ---
     if [[ ${SELECTIONS[0]} -eq 1 ]]; then
         echo -e "${YELLOW}🌊 Tidal Download Setup${NC}"
-        "$PYTHON_PROC" "$SCRIPT_DIR/update_tidal_config.py" "$CURRENT_INPUT"
 
-        if ! "$TIDAL_BIN" cfg &> /dev/null; then
-             echo -e "${RED}⚠️  Login Required...${NC}"
-             "$TIDAL_BIN" login
-        fi
-
-        if [ -f "$TIDAL_URL_FILE" ]; then
-            SAVED_URL=$(cat "$TIDAL_URL_FILE")
-            echo -e "    📂 Found Saved Playlist: ${CYAN}$SAVED_URL${NC}"
-            read -p "    Use this? [Y/n]: " use_saved
-            [[ "$use_saved" =~ ^[Nn]$ ]] && read -p "    Paste NEW Tidal URL: " TIDAL_LINK || TIDAL_LINK="$SAVED_URL"
+        if [[ ! -x "$TIDAL_BIN" ]]; then
+            echo -e "${YELLOW}⚠️ Tidal environment is not available; skipping download step.${NC}" >&2
         else
-            read -p "    Paste Tidal URL: " TIDAL_LINK
-        fi
+            "$BOOTSTRAP_PYTHON" "$SCRIPT_DIR/update_tidal_config.py" "$CURRENT_INPUT"
 
-        [[ -n "$TIDAL_LINK" ]] && echo "$TIDAL_LINK" > "$TIDAL_URL_FILE" && "$TIDAL_BIN" dl "$TIDAL_LINK"
+            if ! "$TIDAL_BIN" cfg >/dev/null 2>&1; then
+                echo -e "${RED}⚠️  Login Required...${NC}"
+                "$TIDAL_BIN" login
+            fi
+
+            TIDAL_LINK="${CURRENT_TIDAL:-}"
+            if [[ -f "$TIDAL_URL_FILE" ]]; then
+                SAVED_URL="$(<"$TIDAL_URL_FILE")"
+                SAVED_URL="$(normalize_tidal_link "$SAVED_URL")"
+                echo -e "    📂 Saved Tidal URL: ${CYAN}$SAVED_URL${NC}"
+                echo "    Press Enter to keep it, or edit/paste a different Tidal URL."
+                TIDAL_LINK="$(prompt_with_current "Tidal URL" "$SAVED_URL")"
+            else
+                TIDAL_LINK="$(prompt_with_current "Tidal URL" "")"
+            fi
+
+            TIDAL_LINK="$(normalize_tidal_link "${TIDAL_LINK:-}")"
+            CURRENT_TIDAL="$TIDAL_LINK"
+
+            if [[ -n "${TIDAL_LINK:-}" ]]; then
+                printf '%s\n' "$TIDAL_LINK" > "$TIDAL_URL_FILE"
+                echo -e "    🌊 Downloading: ${CYAN}$TIDAL_LINK${NC}"
+                if ! "$TIDAL_BIN" dl "$TIDAL_LINK"; then
+                    echo -e "    ${YELLOW}⚠️ Tidal download failed. Check that the playlist is public/available to your logged-in Tidal account.${NC}" >&2
+                fi
+                quarantine_short_tidal_previews "$CURRENT_INPUT"
+            fi
+        fi
     fi
 
     echo -e "\n${GREEN}🚀 PROCESSING BATCH...${NC}"
 
-    mapfile -d $'\0' -t FILE_LIST < <(find "$CURRENT_INPUT" -maxdepth 1 -type f \
-        \( -iname "*.flac" -o -iname "*.wav" -o -iname "*.aiff" -o -iname "*.m4a" -o -iname "*.mp3" \) -print0)
+    mapfile -d $'\0' -t FILE_LIST < <(
+        find "$CURRENT_INPUT" -maxdepth 1 -type f \
+            \( -iname "*.flac" -o -iname "*.wav" -o -iname "*.aiff" -o -iname "*.m4a" -o -iname "*.mp3" \) -print0
+    )
 
+    if [[ ${#FILE_LIST[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}⚠️ No audio files found in $CURRENT_INPUT${NC}"
+        return 0
+    fi
+
+    local raw_file
     for raw_file in "${FILE_LIST[@]}"; do
         [[ -z "$raw_file" ]] && continue
-
-        STEM_CREATED=0
-        is_temp_file=0
-        filename=$(basename "$raw_file")
-        base_name="${filename%.*}"
-        current_source=$(realpath "$raw_file")
-        IS_STEM=0
-        [[ "$filename" == *".stem.m4a" ]] && IS_STEM=1
-
-        echo "---------------------------------------------------"
-        echo -e "🎵 ${CYAN}$filename${NC}"
-
-        # --- STEP A: ONETAGGER ---
-        if [[ ${SELECTIONS[1]} -eq 1 ]]; then
-            echo "    🏷️  Running OneTagger..."
-            timeout 2m "$BIN_DIR/onetagger-cli" autotagger --config "$ONETAGGER_CONF" --path "$current_source"
+        if ! process_single_file "$raw_file"; then
+            echo -e "${YELLOW}⚠️ Failed to process $(basename "$raw_file"); continuing with next file.${NC}" >&2
         fi
-
-        # --- STEP B: NORMALIZE & CONVERT ---
-        #
-        # When stems are enabled, we always write the intermediate file to
-        # /tmp so stemgen's cleanup never touches the output folder.
-        # Stemgen's clean_dir() deletes ALL .m4a files from its input
-        # directory — writing intermediates to /tmp avoids that.
-
-        STEMS_ENABLED=0
-        [[ ${SELECTIONS[3]} -eq 1 && "$IS_STEM" -eq 0 ]] && STEMS_ENABLED=1
-
-        if [[ "$IS_STEM" -eq 1 ]]; then
-            # Existing stem file — only normalize if selected
-            if [[ ${SELECTIONS[2]} -eq 1 ]]; then
-                echo "    🔊 Normalizing Stem..."
-                processed_file=$(process_stem_normalization "$current_source" "$CURRENT_OUTPUT")
-            else
-                cp "$current_source" "$CURRENT_OUTPUT/"
-                processed_file="$CURRENT_OUTPUT/$filename"
-            fi
-        elif [[ ${SELECTIONS[2]} -eq 1 ]] || is_non_aiff_source "$current_source"; then
-            # Needs conversion and/or normalization
-            local norm_flag=${SELECTIONS[2]}
-            if [[ "$STEMS_ENABLED" -eq 1 ]]; then
-                # Write to /tmp — stemgen will use this, then we copy final to output
-                processed_file=$(process_audio_specs "$current_source" "/tmp" "$norm_flag")
-                is_temp_file=1
-            else
-                processed_file=$(process_audio_specs "$current_source" "$CURRENT_OUTPUT" "$norm_flag")
-            fi
-        else
-            # Already AIFF/FLAC and normalization not selected
-            if [[ "$STEMS_ENABLED" -eq 1 ]]; then
-                # Copy to /tmp for stemgen safety
-                cp "$current_source" "/tmp/$filename"
-                processed_file="/tmp/$filename"
-                is_temp_file=1
-            else
-                cp "$current_source" "$CURRENT_OUTPUT/"
-                processed_file="$CURRENT_OUTPUT/$filename"
-            fi
-        fi
-
-        # --- STEP C: STEMGEN ---
-        STEM_FILE=""
-        if [[ "$STEMS_ENABLED" -eq 1 ]]; then
-            echo "    🔨 Handing off to Stemgen..."
-
-            # Note: stemgen's clean_dir() has been patched (see bootstrap.sh)
-            # to not delete .m4a files from the input directory. The input file
-            # is also in /tmp as an extra safety measure.
-            local stem_count_before
-            stem_count_before=$(find "$CURRENT_OUTPUT" -maxdepth 1 -name "*.stem.m4a" 2>/dev/null | wc -l)
-
-            "$STEMGEN_BIN" -i "$processed_file" -n "$STEM_MODEL" --device "$STEM_DEVICE" -o "$CURRENT_OUTPUT/" < /dev/null
-
-            # Find newly created stem (anything that wasn't there before)
-            local stem_count_after
-            stem_count_after=$(find "$CURRENT_OUTPUT" -maxdepth 1 -name "*.stem.m4a" 2>/dev/null | wc -l)
-
-            CREATED_STEM=""
-            if [[ "$stem_count_after" -gt "$stem_count_before" ]]; then
-                CREATED_STEM=$(find "$CURRENT_OUTPUT" -maxdepth 1 -name "*.stem.m4a" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
-            fi
-
-            if [[ -n "$CREATED_STEM" ]]; then
-                # Rename to match original filename (fixes Unicode stripping bug)
-                EXPECTED_STEM="$CURRENT_OUTPUT/${base_name}.stem.m4a"
-                if [[ "$CREATED_STEM" != "$EXPECTED_STEM" ]]; then
-                    mv "$CREATED_STEM" "$EXPECTED_STEM" 2>/dev/null && STEM_FILE="$EXPECTED_STEM" || STEM_FILE="$CREATED_STEM"
-                else
-                    STEM_FILE="$CREATED_STEM"
-                fi
-                STEM_CREATED=1
-                echo "    ✅ Stem Created: $(basename "$STEM_FILE")"
-            else
-                echo "    ⚠️  Stem file not found!"
-            fi
-
-            # Now copy the processed AIFF to its final location (was in /tmp)
-            if [[ "$is_temp_file" -eq 1 && -f "$processed_file" ]]; then
-                cp "$processed_file" "$CURRENT_OUTPUT/"
-                final_file="$CURRENT_OUTPUT/$(basename "$processed_file")"
-            fi
-        fi
-
-        # Determine the final output file path for tagging
-        if [[ -n "$final_file" && -f "$final_file" ]]; then
-            output_file="$final_file"
-        else
-            output_file="$processed_file"
-        fi
-
-        # --- STEP D: DETUNE ---
-        DETUNE_TAG=""
-        if [[ ${SELECTIONS[4]} -eq 1 ]]; then
-            echo "    🎹 Checking Detune..."
-            # Prefer stem file (cleaner signal), fall back to processed file
-            CHECK_FILE="$output_file"
-            [[ "$STEM_CREATED" -eq 1 && -f "$STEM_FILE" ]] && CHECK_FILE="$STEM_FILE"
-            DETUNE_OUT=$("$PYTHON_PROC" "$SCRIPT_DIR/analyze_stems.py" "$CHECK_FILE" 2>&1 | tail -n 1)
-            if [[ "$DETUNE_OUT" =~ ^[+-][0-9]+c$ ]]; then
-                DETUNE_TAG="$DETUNE_OUT"
-            fi
-        fi
-
-        # --- STEP E: TAGGING ---
-        if [[ -n "$DETUNE_TAG" ]]; then
-            "$PYTHON_PROC" "$SCRIPT_DIR/write_tag.py" "$output_file" "$DETUNE_TAG"
-            [[ "$STEM_CREATED" -eq 1 && -f "$STEM_FILE" ]] && \
-                "$PYTHON_PROC" "$SCRIPT_DIR/write_tag.py" "$STEM_FILE" "$DETUNE_TAG"
-            echo "    🎹 Tagged: $DETUNE_TAG"
-        fi
-
-        # --- CLEANUP ---
-        [[ "$is_temp_file" -eq 1 ]] && rm -f "$processed_file"
-        unset final_file output_file
-
     done
 }

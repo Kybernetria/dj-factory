@@ -1,0 +1,34 @@
+# Downloaded helper binaries (OneTagger is downloaded by bootstrap)
+bin/
+
+# Python virtual environments / package installs
+stemgen-venv/
+tidal-venv/
+.venv/
+venv/
+
+# Runtime data
+logs/
+tmp/
+.cache/
+.state/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Personal/user config and saved Tidal URLs
+scripts/tidal_playlist.txt
+*.local
+*.env
+.env*
+
+# Audio/library output; do not publish downloaded music or stems
+*.mp3
+*.flac
+*.wav
+*.aif
+*.aiff
+*.m4a
+*.ogg
+*.opus
+*.stem.mp4

@@ -1,35 +1,28 @@
 import json
-import sys
 import os
+import shutil
+import sys
 
-# 1. VALIDATE INPUT
 if len(sys.argv) < 2:
     print("Error: No target directory provided.")
     sys.exit(1)
 
-# Ensure we handle "~" if passed in quotes
 target_dir = os.path.expanduser(sys.argv[1])
+ffmpeg_bin = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg") or "ffmpeg"
 
-# 2. DEFINE THE "GOLDEN STANDARD" SETTINGS
-# We define these once so they are applied consistently whether
-# we are updating an old file or creating a new one.
 DESIRED_SETTINGS = {
     "download_base_path": target_dir,
+    "skip_existing": False,
     "video_download": False,
-    "path_binary_ffmpeg": "/usr/bin/ffmpeg",
+    "path_binary_ffmpeg": ffmpeg_bin,
     "extract_flac": True,
-    "symlink_to_track": False,  # Turn this OFF if you want real files, not links
+    "symlink_to_track": False,
     "quality_audio": "HI_RES_LOSSLESS",
-
-    # NEW FLAT NAMING STANDARDS
-    # We remove "Playlists/" and "Tracks/" so files sit directly in the base path
     "format_playlist": "{artist_name} - {track_title}",
     "format_track": "{artist_name} - {track_title}",
     "format_album": "{artist_name} - {track_title}"
-
 }
 
-# 3. LOCATE CONFIG
 possible_paths = [
     os.path.expanduser("~/.config/tidal_dl_ng/settings.json"),
     os.path.expanduser("~/.tidal-dl.json")
@@ -37,7 +30,6 @@ possible_paths = [
 
 config_found = False
 
-# 4. ATTEMPT TO UPDATE EXISTING
 for config_path in possible_paths:
     if os.path.exists(config_path):
         print(f"Found config at: {config_path}")
@@ -45,21 +37,18 @@ for config_path in possible_paths:
             with open(config_path, 'r') as f:
                 data = json.load(f)
 
-            # Update/Overwrite keys with our Desired Settings
             for key, value in DESIRED_SETTINGS.items():
                 data[key] = value
 
-            # Save back
             with open(config_path, 'w') as f:
                 json.dump(data, f, indent=4)
 
             print("✅ Config updated successfully.")
             config_found = True
-            break # Stop after finding the first valid config
+            break
         except Exception as e:
             print(f"⚠️ Failed to update {config_path}: {e}")
 
-# 5. CREATE NEW IF MISSING
 if not config_found:
     default_path = possible_paths[0]
     print(f"No config found. Creating new at: {default_path}")

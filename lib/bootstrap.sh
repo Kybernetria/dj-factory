@@ -1,139 +1,540 @@
 #!/usr/bin/env bash
 # lib/bootstrap.sh
 
-# =================================================
-# ENVIRONMENT SETUP
-# =================================================
-setup_environment() {
-    echo -e "${CYAN}🔧 Checking Environment & Dependencies...${NC}"
-
-    # 1. DIRECTORY INITIALIZATION
-    # ---------------------------------------------
-    # Ensure all critical folders exist before we start
-    mkdir -p "$BIN_DIR" "$SCRIPT_DIR" "$DEFAULT_INPUT_DIR" "$DEFAULT_OUTPUT_DIR"
-
-
-    # 2. SYSTEM LIBRARIES (HYBRID SETUP)
-    # ---------------------------------------------
-    # We check for Python 3.12 specifically. If missing, we install the PPA.
-    if ! command -v python3.12 &> /dev/null; then
-        echo -e "${RED}❌ Installing Python 3.12 & System Libs...${NC}"
-
-        sudo apt-get update
-        sudo apt-get install -y software-properties-common
-        sudo add-apt-repository ppa:deadsnakes/ppa -y
-        sudo apt-get update
-
-        # Install Audio Tools (ffmpeg, sox) and Python Build deps
-        sudo apt-get install -y ffmpeg sox libsox-fmt-all git wget curl libjpeg62 \
-            python3-venv python3-dev build-essential \
-            python3.12 python3.12-venv python3.12-dev
-    fi
-
-
-    # 3. ONETAGGER INSTALLATION
-    # ---------------------------------------------
-    # Checks if the binary exists; if not, fetches the latest version.
-    if [ ! -f "$BIN_DIR/onetagger-cli" ]; then
-        echo -e "${CYAN}📦 Installing OneTagger...${NC}"
-
-        # Try to get dynamic link, fall back to hardcoded 1.7.0 if script fails
-        LATEST_URL=$(python3 "$SCRIPT_DIR/get_latest_onetagger.py" 2>/dev/null)
-        if [ -z "$LATEST_URL" ]; then
-             LATEST_URL="https://github.com/Marekkon5/onetagger/releases/download/1.7.0/OneTagger-linux-cli.tar.gz"
-        fi
-
-        # Download and Extract
-        TEMP_DIR=$(mktemp -d)
-        wget -q -O "$TEMP_DIR/onetagger.tar.gz" "$LATEST_URL"
-        tar -xzf "$TEMP_DIR/onetagger.tar.gz" -C "$TEMP_DIR"
-
-        # Find the binary inside the extracted folder (regardless of folder name)
-        EXTRACTED_BIN=$(find "$TEMP_DIR" -type f -executable | head -n 1)
-        if [ -n "$EXTRACTED_BIN" ]; then
-            mv "$EXTRACTED_BIN" "$BIN_DIR/onetagger-cli"
-            chmod +x "$BIN_DIR/onetagger-cli"
-        fi
-        rm -rf "$TEMP_DIR"
-    fi
-
-
-    # 4. VIRTUAL ENVIRONMENTS
-    # ---------------------------------------------
-
-    # --- A. STEMGEN (Python 3.10 / Default System Python) ---
-    # "THE IRON LOCK FIX": Specific versions to prevent dependency hell
-    if [ ! -d "$VENV_STEMGEN" ]; then
-        echo -e "${CYAN}📦 Setting up Stemgen (Solver Mode)...${NC}"
-
-        python3 -m venv "$VENV_STEMGEN"
-        source "$VENV_STEMGEN/bin/activate"
-        pip install --upgrade pip
-
-        # 1. Install CPU-only Torch first (lighter, faster)
-        pip install torch==2.2.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cpu
-
-        # 2. Install everything else in ONE go to force pip to solve versions correctly
-        # pinning numpy<2 prevents the recent API breakage in audio libs
-        pip install "numpy<2" "demucs<4.1" "librosa<0.11" "mutagen" "essentia" "git+https://github.com/axeldelafosse/stemgen"
-
-        # PATCH: fix stemgen bug where clean_dir() deletes all .m4a from input dir
-        # This nukes previously-generated stems when input dir == output dir.
-        local stemgen_cli="$VENV_STEMGEN/lib/python3.11/site-packages/stemgen/cli.py"
-        if [ -f "$stemgen_cli" ]; then
-            sed -i '/for file in os\.listdir(INPUT_DIR):/,/os\.remove(os\.path\.join(INPUT_DIR, file))/c\
-    # PATCHED: removed .m4a deletion loop (destroyed previous stems)' "$stemgen_cli"
-        fi
-
-        deactivate
-    fi
-
-    # --- B. TIDAL-DL (Python 3.12) ---
-    # Uses the NG fork for better Hi-Res support
-    if [ ! -d "$VENV_TIDAL" ]; then
-        echo -e "${CYAN}📦 Setting up Tidal (Py3.12)...${NC}"
-
-        python3.12 -m venv "$VENV_TIDAL"
-        source "$VENV_TIDAL/bin/activate"
-        pip install --upgrade pip
-
-        # Install from specific git fork branch
-        pip install 'git+https://github.com/nilleiz/tidal_dl_ng.git#egg=tidal-dl-ng[gui]'
-
-        deactivate
-    fi
-
-
-    # 5. EXPORT BINARIES
-    # ---------------------------------------------
-    # Make these paths available to the rest of the pipeline
-    export PYTHON_PROC="$VENV_STEMGEN/bin/python3"
-    export TIDAL_BIN="$VENV_TIDAL/bin/tidal-dl-ng"
-    export STEMGEN_BIN="$VENV_STEMGEN/bin/stemgen"
-    export FFMPEG_BIN="/usr/bin/ffmpeg"
-    export FFPROBE_BIN="/usr/bin/ffprobe"
+log_info() {
+    echo -e "${CYAN}$*${NC}"
 }
 
-# =================================================
-# DESKTOP INTEGRATION
-# =================================================
+log_warn() {
+    echo -e "${YELLOW}$*${NC}" >&2
+}
+
+log_error() {
+    echo -e "${RED}$*${NC}" >&2
+}
+
+die() {
+    log_error "$1"
+    exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+run_as_root() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+    elif command_exists sudo; then
+        sudo "$@"
+    else
+        die "Need sudo/root to install system packages: $*"
+    fi
+}
+
+detect_package_manager() {
+    if command_exists apt-get; then
+        echo "apt"
+    elif command_exists dnf; then
+        echo "dnf"
+    elif command_exists pacman; then
+        echo "pacman"
+    elif command_exists zypper; then
+        echo "zypper"
+    else
+        echo "unknown"
+    fi
+}
+
+install_linux_packages() {
+    local pm="$1"
+    shift
+
+    if [[ $# -eq 0 ]]; then
+        return 0
+    fi
+
+    case "$pm" in
+        apt)
+            run_as_root apt-get update
+            run_as_root apt-get install -y "$@"
+            ;;
+        dnf)
+            run_as_root dnf install -y "$@"
+            ;;
+        pacman)
+            run_as_root pacman -Sy --noconfirm "$@"
+            ;;
+        zypper)
+            run_as_root zypper --non-interactive install "$@"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_immutable_linux_host() {
+    [[ -e /run/ostree-booted || -e /run/bootc-install/reboot-needed || -d /sysroot/ostree ]]
+}
+
+maybe_install_linux_packages() {
+    local pm
+    pm="$(detect_package_manager)"
+
+    if [[ "$pm" == "unknown" ]]; then
+        log_warn "⚠️ No supported package manager detected. Install dependencies manually."
+        return 1
+    fi
+
+    if is_immutable_linux_host; then
+        log_warn "⚠️ Immutable/read-only Linux host detected. Skipping automatic package installation."
+        log_warn "   Install missing packages via your host workflow (rpm-ostree/bootc layering, toolbox, or distrobox)."
+        return 1
+    fi
+
+    if ! install_linux_packages "$pm" "$@"; then
+        log_warn "⚠️ Package installation failed with $pm. You may need to install some dependencies manually."
+        return 1
+    fi
+
+    return 0
+}
+
+resolve_download_tool() {
+    if command_exists curl; then
+        echo "curl"
+    elif command_exists wget; then
+        echo "wget"
+    else
+        return 1
+    fi
+}
+
+download_file() {
+    local url="$1"
+    local output_path="$2"
+    local downloader
+
+    downloader="$(resolve_download_tool)" || return 1
+
+    if [[ "$downloader" == "curl" ]]; then
+        curl -fsSL "$url" -o "$output_path"
+    else
+        wget -q -O "$output_path" "$url"
+    fi
+}
+
+venv_python_ready() {
+    local python_bin="$1"
+    [[ -x "$python_bin" ]] && "$python_bin" -V >/dev/null 2>&1
+}
+
+find_python_interpreter() {
+    local candidate
+    local resolved
+
+    for candidate in "$@"; do
+        [[ -z "${candidate:-}" ]] && continue
+
+        if [[ "$candidate" == */* && -x "$candidate" ]]; then
+            resolved="$candidate"
+        elif command_exists "$candidate"; then
+            resolved="$(command -v "$candidate")"
+        else
+            continue
+        fi
+
+        if "$resolved" - <<'PY' >/dev/null 2>&1
+import sys
+sys.exit(0 if sys.version_info >= (3, 10) else 1)
+PY
+        then
+            echo "$resolved"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+python_version_string() {
+    local python_bin="$1"
+    "$python_bin" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+PY
+}
+
+stemgen_env_ready() {
+    venv_python_ready "$VENV_STEMGEN/bin/python" || return 1
+    [[ -x "$VENV_STEMGEN/bin/stemgen" ]] || return 1
+
+    "$VENV_STEMGEN/bin/python" - <<'PY' >/dev/null 2>&1
+import importlib
+for module in ("librosa", "mutagen", "torch"):
+    importlib.import_module(module)
+PY
+}
+
+tidal_env_ready() {
+    venv_python_ready "$VENV_TIDAL/bin/python" || return 1
+    [[ -x "$VENV_TIDAL/bin/tidal-dl-ng" ]] || return 1
+
+    "$VENV_TIDAL/bin/python" - <<'PY' >/dev/null 2>&1
+import tidal_dl_ng.cli
+PY
+}
+
+ensure_system_prerequisites() {
+    local missing=()
+    local packages=()
+    local item
+
+    command_exists git || missing+=(git)
+    command_exists tar || missing+=(tar)
+    command_exists ffmpeg || missing+=(ffmpeg)
+    command_exists ffprobe || missing+=(ffmpeg)
+    if ! command_exists curl && ! command_exists wget; then
+        missing+=(download-tool)
+    fi
+    if ! command_exists python3 && ! command_exists python; then
+        missing+=(python3)
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_info "📦 Installing missing Linux packages: ${missing[*]}"
+
+        case "$(detect_package_manager)" in
+            apt)
+                for item in "${missing[@]}"; do
+                    case "$item" in
+                        git) packages+=(git) ;;
+                        tar) packages+=(tar) ;;
+                        ffmpeg) packages+=(ffmpeg) ;;
+                        download-tool) packages+=(curl wget) ;;
+                        python3) packages+=(python3 python3-venv python3-pip) ;;
+                    esac
+                done
+                ;;
+            dnf)
+                for item in "${missing[@]}"; do
+                    case "$item" in
+                        git) packages+=(git) ;;
+                        tar) packages+=(tar) ;;
+                        ffmpeg) packages+=(ffmpeg) ;;
+                        download-tool) packages+=(curl wget) ;;
+                        python3) packages+=(python3 python3-pip) ;;
+                    esac
+                done
+                ;;
+            pacman)
+                for item in "${missing[@]}"; do
+                    case "$item" in
+                        git) packages+=(git) ;;
+                        tar) packages+=(tar) ;;
+                        ffmpeg) packages+=(ffmpeg) ;;
+                        download-tool) packages+=(curl wget) ;;
+                        python3) packages+=(python python-pip) ;;
+                    esac
+                done
+                ;;
+            zypper)
+                for item in "${missing[@]}"; do
+                    case "$item" in
+                        git) packages+=(git) ;;
+                        tar) packages+=(tar) ;;
+                        ffmpeg) packages+=(ffmpeg) ;;
+                        download-tool) packages+=(curl wget) ;;
+                        python3) packages+=(python3 python3-pip) ;;
+                    esac
+                done
+                ;;
+        esac
+
+        [[ ${#packages[@]} -gt 0 ]] && maybe_install_linux_packages "${packages[@]}"
+    fi
+
+    command_exists ffmpeg || die "ffmpeg is required. Install it and rerun DJ_Factory."
+    command_exists ffprobe || die "ffprobe is required. Install it and rerun DJ_Factory."
+    command_exists git || die "git is required. Install it and rerun DJ_Factory."
+    command_exists tar || die "tar is required. Install it and rerun DJ_Factory."
+    if ! command_exists curl && ! command_exists wget; then
+        die "Need curl or wget to download dependencies."
+    fi
+}
+
+ensure_optional_python_toolchains() {
+    local packages=()
+    local pm
+
+    pm="$(detect_package_manager)"
+    case "$pm" in
+        apt)
+            packages=(python3.11 python3.11-venv python3.11-dev python3.12 python3.12-venv python3.12-dev)
+            ;;
+        dnf)
+            packages=(python3.11 python3.11-devel python3.12 python3.12-devel)
+            ;;
+        zypper)
+            packages=(python311 python311-pip python312 python312-pip)
+            ;;
+        *)
+            packages=()
+            ;;
+    esac
+
+    if [[ ${#packages[@]} -gt 0 ]]; then
+        maybe_install_linux_packages "${packages[@]}" || true
+    fi
+}
+
+prepare_python_selection() {
+    BOOTSTRAP_PYTHON="$(find_python_interpreter "${BOOTSTRAP_PYTHON:-}" python3 python)" || \
+        die "Could not find a usable Python interpreter (>= 3.10)."
+
+    STEMGEN_BUILD_PYTHON="$(find_python_interpreter "${STEMGEN_PYTHON:-}" python3.11 python3.10 python3)" || \
+        die "Could not find Python for Stemgen. Install python3.11 or set STEMGEN_PYTHON=/path/to/python3.11."
+
+    TIDAL_BUILD_PYTHON="$(find_python_interpreter "${TIDAL_PYTHON:-}" python3.12 python3.11 python3)" || \
+        die "Could not find Python for Tidal. Install python3.12 or set TIDAL_PYTHON=/path/to/python."
+
+    export BOOTSTRAP_PYTHON STEMGEN_BUILD_PYTHON TIDAL_BUILD_PYTHON
+
+    local stemgen_version
+    stemgen_version="$(python_version_string "$STEMGEN_BUILD_PYTHON")"
+    if [[ "$stemgen_version" != 3.11.* ]]; then
+        log_warn "⚠️ Stemgen is being built with Python $stemgen_version. Python 3.11 is preferred."
+    else
+        log_info "🐍 Stemgen will use Python $stemgen_version"
+    fi
+
+    local tidal_version
+    tidal_version="$(python_version_string "$TIDAL_BUILD_PYTHON")"
+    log_info "🐍 Tidal environment will use Python $tidal_version"
+}
+
+resolve_runtime_binaries() {
+    FFMPEG_BIN="${FFMPEG_BIN:-$(command -v ffmpeg)}"
+    FFPROBE_BIN="${FFPROBE_BIN:-$(command -v ffprobe)}"
+
+    [[ -x "$FFMPEG_BIN" ]] || die "Resolved ffmpeg path is not executable: $FFMPEG_BIN"
+    [[ -x "$FFPROBE_BIN" ]] || die "Resolved ffprobe path is not executable: $FFPROBE_BIN"
+
+    export FFMPEG_BIN FFPROBE_BIN
+}
+
+install_onetagger() {
+    if [[ -x "$BIN_DIR/onetagger-cli" ]]; then
+        return 0
+    fi
+
+    log_info "📦 Installing OneTagger into $BIN_DIR"
+
+    local latest_url
+    latest_url="$("$BOOTSTRAP_PYTHON" "$SCRIPT_DIR/get_latest_onetagger.py" 2>/dev/null || true)"
+    if [[ -z "$latest_url" ]]; then
+        latest_url="https://github.com/Marekkon5/onetagger/releases/download/1.7.0/OneTagger-linux-cli.tar.gz"
+    fi
+
+    local temp_dir
+    temp_dir="$(mktemp -d "$TMP_DIR/onetagger.XXXXXX")" || die "Failed to create temporary directory for OneTagger."
+
+    if ! download_file "$latest_url" "$temp_dir/onetagger.tar.gz"; then
+        rm -rf "$temp_dir"
+        die "Failed to download OneTagger from $latest_url"
+    fi
+
+    if ! tar -xzf "$temp_dir/onetagger.tar.gz" -C "$temp_dir"; then
+        rm -rf "$temp_dir"
+        die "Failed to extract OneTagger archive."
+    fi
+
+    local extracted_bin
+    extracted_bin="$(find "$temp_dir" -type f \( -name 'onetagger-cli' -o -name 'OneTagger*' \) -perm /111 | head -n 1)"
+    if [[ -z "$extracted_bin" ]]; then
+        extracted_bin="$(find "$temp_dir" -type f -perm /111 | head -n 1)"
+    fi
+
+    [[ -n "$extracted_bin" ]] || {
+        rm -rf "$temp_dir"
+        die "Could not find OneTagger executable inside archive."
+    }
+
+    mv -f "$extracted_bin" "$BIN_DIR/onetagger-cli"
+    chmod +x "$BIN_DIR/onetagger-cli"
+    rm -rf "$temp_dir"
+}
+
+patch_stemgen_cleanup_bug() {
+    local stemgen_cli
+
+    stemgen_cli="$("$VENV_STEMGEN/bin/python" - <<'PY'
+import os
+import site
+import sysconfig
+candidates = []
+for path in site.getsitepackages():
+    candidates.append(os.path.join(path, "stemgen", "cli.py"))
+platlib = sysconfig.get_paths().get("platlib")
+if platlib:
+    candidates.append(os.path.join(platlib, "stemgen", "cli.py"))
+for candidate in candidates:
+    if os.path.isfile(candidate):
+        print(candidate)
+        break
+PY
+)"
+
+    if [[ -n "$stemgen_cli" && -f "$stemgen_cli" ]]; then
+        if grep -q 'os.remove(os.path.join(INPUT_DIR, file))' "$stemgen_cli"; then
+            sed -i '/for file in os\.listdir(INPUT_DIR):/,/os\.remove(os\.path\.join(INPUT_DIR, file))/c\
+    # PATCHED_DJ_FACTORY: removed .m4a deletion loop (destroyed previous stems)' "$stemgen_cli"
+            log_info "🩹 Patched stemgen cleanup bug."
+        fi
+    fi
+}
+
+ensure_stemgen_env() {
+    if stemgen_env_ready; then
+        log_info "✅ Reusing existing Stemgen environment."
+        patch_stemgen_cleanup_bug
+        return 0
+    fi
+
+    if [[ -d "$VENV_STEMGEN" ]]; then
+        log_warn "♻️ Rebuilding broken Stemgen environment in $VENV_STEMGEN"
+        rm -rf "$VENV_STEMGEN"
+    fi
+
+    log_info "📦 Setting up Stemgen in repo-local venv..."
+
+    "$STEMGEN_BUILD_PYTHON" -m venv "$VENV_STEMGEN" || die "Failed to create Stemgen virtualenv."
+    "$VENV_STEMGEN/bin/python" -m pip install --upgrade pip setuptools wheel || die "Failed to upgrade pip for Stemgen."
+    "$VENV_STEMGEN/bin/python" -m pip install torch==2.2.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cpu || \
+        die "Failed to install torch for Stemgen."
+    "$VENV_STEMGEN/bin/python" -m pip install "numpy<2" "demucs<4.1" "librosa<0.11" "mutagen" "essentia" "git+https://github.com/axeldelafosse/stemgen" || \
+        die "Failed to install Stemgen dependencies."
+
+    patch_stemgen_cleanup_bug
+    stemgen_env_ready || die "Stemgen environment did not validate after installation."
+}
+
+patch_tidal_imports() {
+    local tidal_pkg_dir
+    local cli_file
+    local gui_file
+
+    tidal_pkg_dir="$VENV_TIDAL/lib/python3.12/site-packages/tidal_dl_ng"
+    [[ -d "$tidal_pkg_dir" ]] || return 0
+
+    cli_file="$tidal_pkg_dir/cli.py"
+    gui_file="$tidal_pkg_dir/gui.py"
+
+    if [[ -f "$cli_file" ]]; then
+        sed -i 's/^from config import HandlingApp$/from tidal_dl_ng.config import HandlingApp/' "$cli_file"
+    fi
+
+    if [[ -f "$gui_file" ]]; then
+        sed -i 's/^from config import HandlingApp$/from tidal_dl_ng.config import HandlingApp/' "$gui_file"
+    fi
+}
+
+ensure_tidal_env() {
+    local tidal_pip_spec="${TIDAL_PIP_SPEC:-tidal-dl-ng[gui] @ https://github.com/r3ferrei/tidal-dl-ng-1/archive/refs/heads/master.zip}"
+
+    if [[ -d "$VENV_TIDAL" ]]; then
+        patch_tidal_imports
+    fi
+
+    if tidal_env_ready; then
+        log_info "✅ Reusing existing Tidal environment."
+        return 0
+    fi
+
+    if [[ -d "$VENV_TIDAL" ]]; then
+        log_warn "♻️ Rebuilding broken Tidal environment in $VENV_TIDAL"
+        rm -rf "$VENV_TIDAL"
+    fi
+
+    log_info "📦 Setting up Tidal in repo-local venv..."
+
+    "$TIDAL_BUILD_PYTHON" -m venv "$VENV_TIDAL" || {
+        log_warn "⚠️ Failed to create Tidal virtualenv. Tidal download will be unavailable."
+        return 1
+    }
+
+    "$VENV_TIDAL/bin/python" -m pip install --upgrade pip setuptools wheel || {
+        log_warn "⚠️ Failed to upgrade pip for Tidal. Tidal download will be unavailable."
+        return 1
+    }
+
+    env -u GIT_ASKPASS -u SSH_ASKPASS -u GCM_INTERACTIVE -u GH_TOKEN \
+        GIT_TERMINAL_PROMPT=0 \
+        "$VENV_TIDAL/bin/python" -m pip install "$tidal_pip_spec" || {
+        log_warn "⚠️ Failed to install tidal-dl-ng. Tidal download will be unavailable."
+        log_warn "   You can override the source with TIDAL_PIP_SPEC='<package or URL>'."
+        return 1
+    }
+
+    patch_tidal_imports
+
+    if ! tidal_env_ready; then
+        log_warn "⚠️ Tidal environment did not validate after installation. Tidal download will be unavailable."
+        return 1
+    fi
+
+    return 0
+}
+
+setup_environment() {
+    log_info "🔧 Checking Environment & Dependencies..."
+
+    mkdir -p "$BIN_DIR" "$SCRIPT_DIR" "$DEFAULT_INPUT_DIR" "$DEFAULT_OUTPUT_DIR" \
+        "$CACHE_DIR" "$STATE_DIR" "$LOG_DIR" "$TMP_DIR"
+
+    ensure_system_prerequisites
+    ensure_optional_python_toolchains
+    prepare_python_selection
+    resolve_runtime_binaries
+    install_onetagger
+    ensure_stemgen_env
+    ensure_tidal_env || true
+
+    export PYTHON_PROC="$VENV_STEMGEN/bin/python"
+    if [[ -x "$VENV_TIDAL/bin/tidal-dl-ng" ]]; then
+        export TIDAL_BIN="$VENV_TIDAL/bin/tidal-dl-ng"
+    else
+        export TIDAL_BIN=""
+    fi
+    export STEMGEN_BIN="$VENV_STEMGEN/bin/stemgen"
+
+    printf 'completed %s\n' "$(date -Is)" > "$SETUP_MARKER"
+    log_info "✅ Environment ready."
+}
+
 create_desktop_shortcut() {
-    DESKTOP_FILE="$HOME/.local/share/applications/DJ_Factory.desktop"
-    EXEC_PATH="$ROOT_DIR/main.sh"
+    local desktop_file
+    local exec_path
+    local icon_path
 
-    # Fallback icon if custom png is missing
-    ICON_PATH="$ROOT_DIR/icon.png"
-    if [ ! -f "$ICON_PATH" ]; then ICON_PATH="utilities-terminal"; fi
+    desktop_file="${XDG_DATA_HOME:-$HOME/.local/share}/applications/DJ_Factory.desktop"
+    exec_path="$ROOT_DIR/main.sh"
+    icon_path="$ROOT_DIR/icon.png"
 
-    cat << EOF > "$DESKTOP_FILE"
+    mkdir -p "$(dirname "$desktop_file")"
+    [[ -f "$icon_path" ]] || icon_path="utilities-terminal"
+
+    cat > "$desktop_file" <<EOF
 [Desktop Entry]
 Type=Application
 Name=DJ_Factory
 Comment=Automated Audio Processing Tool
-Exec="$EXEC_PATH"
-Icon="$ICON_PATH"
+Exec=$exec_path
+Icon=$icon_path
 Terminal=true
 Categories=Audio;Utility;
 EOF
-    chmod +x "$DESKTOP_FILE"
+
+    chmod +x "$desktop_file"
 }

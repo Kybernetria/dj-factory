@@ -16,9 +16,11 @@ import sys
 import subprocess
 import tempfile
 import warnings
+import shutil
 import numpy as np
 
 warnings.filterwarnings("ignore")
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg") or "ffmpeg"
 
 
 def analyze_tuning(path):
@@ -26,7 +28,6 @@ def analyze_tuning(path):
     try:
         y, sr = librosa.load(path, mono=True, offset=30, duration=30)
         if len(y) < sr * 2:
-            # File too short — try from the beginning
             y, sr = librosa.load(path, mono=True, duration=30)
         if len(y) < sr:
             return 0.0
@@ -39,25 +40,26 @@ def analyze_stem_file(filepath):
     """Extract and analyze individual stem channels from a .stem.m4a."""
     deviations = []
 
-    # Stem files typically have streams: 0=mix, 1=drums, 2=bass, 3=other, 4=vocals
-    # We skip drums (mostly unpitched) and the mix (redundant)
     for idx in [2, 3, 4]:
         fd, temp = tempfile.mkstemp(suffix='.wav')
         os.close(fd)
         try:
-            subprocess.run([
-                '/usr/bin/ffmpeg', '-v', 'error',
+            result = subprocess.run([
+                FFMPEG_BIN, '-v', 'error',
                 '-i', filepath,
                 '-map', f'0:{idx}',
                 '-c:a', 'pcm_s16le', '-y', temp
-            ], capture_output=True, stdin=subprocess.DEVNULL)
+            ], capture_output=True, stdin=subprocess.DEVNULL, check=False)
 
-            if os.path.getsize(temp) > 1000:
+            if result.returncode == 0 and os.path.exists(temp) and os.path.getsize(temp) > 1000:
                 cents = analyze_tuning(temp)
                 if abs(cents) > 5:
                     deviations.append(cents)
+        except FileNotFoundError:
+            return []
         finally:
-            os.unlink(temp)
+            if os.path.exists(temp):
+                os.unlink(temp)
 
     return deviations
 
@@ -80,7 +82,6 @@ if __name__ == "__main__":
         sys.stderr.write(f"File not found: {filepath}\n")
         sys.exit(1)
 
-    # Decide analysis mode based on file type
     if filepath.lower().endswith('.stem.m4a'):
         deviations = analyze_stem_file(filepath)
     else:
