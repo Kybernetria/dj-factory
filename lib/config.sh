@@ -5,7 +5,13 @@
 # 1. CONTAINER SETTINGS
 # =================================================
 BOX_NAME="${BOX_NAME:-Ustembox}"
-BOX_IMAGE="${BOX_IMAGE:-ubuntu:22.04}"
+# Long-term support preference and policy-friendly Ubuntu Toolbox images.
+UBUNTU_LTS_VERSION="${UBUNTU_LTS_VERSION:-24.04}"
+BOX_IMAGE="${BOX_IMAGE:-quay.io/toolbx-images/ubuntu-toolbox:${UBUNTU_LTS_VERSION}}"
+# Fallback order:
+# 1) LTS Toolbox images under quay.io/toolbx-images (usually preferred on secureblue policy)
+# 2) broad policy-compatible Ubuntu dev image kept only as a compatibility fallback
+BOX_IMAGE_FALLBACKS="${BOX_IMAGE_FALLBACKS:-$BOX_IMAGE quay.io/toolbx-images/ubuntu-toolbox:22.04 quay.io/toolbx-images/ubuntu-toolbox:latest docker.io/rocm/dev-ubuntu-24.04}"
 USE_DISTROBOX="${USE_DISTROBOX:-1}"
 
 # =================================================
@@ -74,7 +80,7 @@ NC='\033[0m'
 # =================================================
 # 7. EXPORTS
 # =================================================
-export BOX_NAME BOX_IMAGE USE_DISTROBOX
+export BOX_NAME BOX_IMAGE BOX_IMAGE_FALLBACKS UBUNTU_LTS_VERSION USE_DISTROBOX
 export ROOT_DIR LIB_DIR SCRIPT_DIR BIN_DIR CACHE_DIR STATE_DIR LOG_DIR TMP_DIR
 export VENV_STEMGEN VENV_TIDAL TIDAL_URL_FILE ONETAGGER_CONF SETUP_MARKER
 export DEFAULT_INPUT_DIR DEFAULT_TIDAL_DIR DEFAULT_OUTPUT_DIR SYSTEM_MUSIC_DIR

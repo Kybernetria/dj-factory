@@ -125,11 +125,40 @@ enter_distrobox_if_needed() {
     ensure_distrobox
     ensure_container_runtime
 
+    create_distrobox_if_missing() {
+        local image
+        local tried=0
+        local stdout_file
+        local stderr_file
+        stdout_file="$(mktemp)"
+        stderr_file="$(mktemp)"
+
+        for image in $BOX_IMAGE_FALLBACKS; do
+            if ((tried > 0)); then
+                echo -e "\033[0;33m↪ Trying fallback image: $image\033[0m"
+            fi
+            tried=$((tried + 1))
+            if distrobox create -n "$BOX_NAME" -i "$image" --yes \
+                >"$stdout_file" 2>"$stderr_file"; then
+                BOX_IMAGE="$image"
+                cat "$stdout_file"
+                echo -e "\033[0;32m✓ Created '$BOX_NAME' from ${BOX_IMAGE}\033[0m"
+                rm -f "$stdout_file" "$stderr_file"
+                return 0
+            fi
+            echo "distrobox create failed for $image"
+            cat "$stderr_file"
+        done
+
+        rm -f "$stdout_file" "$stderr_file"
+        return 1
+    }
+
     if ! distrobox list 2>/dev/null | grep -Eq "(^|[[:space:]])${BOX_NAME}([[:space:]]|$)"; then
-        echo -e "\033[0;33m⚠️  Container '$BOX_NAME' missing. Creating from $BOX_IMAGE...\033[0m"
-        if ! distrobox create -n "$BOX_NAME" -i "$BOX_IMAGE" --yes; then
+        echo -e "\033[0;33m⚠️  Container '$BOX_NAME' missing. Trying supported Ubuntu images...\033[0m"
+        if ! create_distrobox_if_missing; then
             if ! distrobox list 2>/dev/null | grep -Eq "(^|[[:space:]])${BOX_NAME}([[:space:]]|$)"; then
-                die "Failed to create Distrobox container '$BOX_NAME'."
+                die "Failed to create Distrobox container '$BOX_NAME'. Set BOX_IMAGE (or BOX_IMAGE_FALLBACKS) to an image accepted by your host's container policy."
             fi
         fi
     fi
